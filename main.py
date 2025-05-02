@@ -15,6 +15,9 @@ from werkzeug.utils import secure_filename
 import uuid
 import asyncio
 import time
+import atexit
+import select
+import threading
 
 UPLOAD_FOLDER = 'uploads'
 DB_PATH = 'email_tool.db'
@@ -54,6 +57,7 @@ SELECT_TEMPLATE = '''
   <input type="submit" value="Start Sending">
 </form>
 '''
+
 INBOX_TEMPLATE = '''
 <h2>Inbox</h2>
 {% for msg in messages %}
@@ -63,13 +67,26 @@ INBOX_TEMPLATE = '''
     <p><b>Body:</b> {{ msg['body'] }}</p>
     <form method="post" action="/reply">
       <input type="hidden" name="to" value="{{ msg['from'] }}">
-      <textarea name="body" placeholder="Your reply..."></textarea>
+      <input type="hidden" name="subject" value="{{ msg['subject'] }}">
+      <input type="hidden" name="message_id" value="{{ msg['message_id'] }}">
+      <input type="hidden" name="references" value="{{ msg['references'] }}">
+      <input type="hidden" name="original_body" value="{{ msg['body'] }}">
+      <textarea name="body" placeholder="Your reply..." style="width: 100%; height: 100px;"></textarea>
       <input type="submit" value="Reply">
     </form>
   </div>
 {% endfor %}
 '''
 
+# Create the scheduler
+scheduler = BackgroundScheduler()
+
+all_messages = []
+imap_blacklist = {}
+BLACKLIST_DURATION = 3600
+
+# Stores active message lists per inbox
+per_account_messages = {}
 
 # Database setup
 with sqlite3.connect(DB_PATH) as conn:
@@ -271,94 +288,88 @@ def background_inbox_fetch_parallel():
     with sqlite3.connect(DB_PATH) as conn:
         accounts = conn.execute("SELECT imap_host, imap_port, imap_user, imap_pass FROM accounts").fetchall()
     
-    async def launch_all(accounts):
-        tasks = []
+    def launch_all(accounts):
         for host, port, user, pwd in accounts:
-            tasks.append(asyncio.create_task(persistent_check_loop(host, port, user, pwd)))
-        print("Running")
-        await asyncio.gather(*tasks)
+            threading.Thread(target=persistent_check_loop, args=(host, port, user, pwd), daemon=True).start()
     
-    def launcher(accounts):
-        asyncio.run(launch_all(accounts))
+    threading.Thread(target=launch_all, args=(accounts,), daemon=True).start()
 
-    threading.Thread(target=launcher, args=(accounts,), daemon=True).start()
-
-import atexit
-
-# Create the scheduler
-scheduler = BackgroundScheduler()
-
-import threading
-
-all_messages = []
-imap_blacklist = {}
-BLACKLIST_DURATION = 3600
-
-# Stores active message lists per inbox
-per_account_messages = {}
-import select
-
-async def persistent_check_loop(host, port, user, pwd):
+def persistent_check_loop(host, port, user, pwd):
     key = f"{user}@{host}:{port}"
     print(f"[IDLE LOOP STARTED] {key} is now running in persistent IDLE mode.")
 
     while True:
         try:
-            with imaplib.IMAP4_SSL(host, port) as mail:
-                print("Attempting login")
+            with imaplib.IMAP4_SSL(host, port, timeout=30) as mail:
+                mail.debug = 4
                 mail.login(user, pwd)
                 mail.select("inbox")
 
-                while True:
-                    print(f"[IDLE] {key} entering IDLE...")
-                    tag = mail._new_tag()
-                    mail.send(f"{tag} IDLE\r\n".encode())
-                    if not mail.readline().startswith(b'+'):
-                        raise Exception("IDLE not acknowledged")
+                try:
+                    while True:
+                        print(f"[IDLE] {key} entering IDLE...")
+                        tag = mail._new_tag()
+                        mail.send(f"{tag} IDLE\r\n".encode())
+                        if not mail.readline().startswith(b'+'):
+                            raise Exception("IDLE not acknowledged")
 
-                    # Wait for a change or timeout (29 minutes max)
-                    if select.select([mail.sock], [], [], 1740)[0]:
-                        print(f"[IDLE] {key} change detected!")
-                        mail.send(b"DONE\r\n")
+                        # Wait for change or timeout
+                        if select.select([mail.sock], [], [], 1740)[0]:
+                            print(f"[IDLE] {key} change detected!")
+                            mail.send(b"DONE\r\n")
 
-                        # Flush server's IDLE DONE response
-                        while True:
-                            line = mail.readline()
-                            if line.startswith(tag.encode()):
-                                break
+                            # Flush full DONE response
+                            while True:
+                                line = mail.readline()
+                                if line.startswith(tag.encode()):
+                                    break
 
-                        # Small wait before next command to avoid race conditions
-                        await asyncio.sleep(0.2)
+                            time.sleep(0.2)
 
-                        # Now fetch unseen messages
-                        typ, data = mail.search(None, 'UNSEEN')
-                        messages = []
-                        for num in data[0].split():
-                            typ, msg_data = mail.fetch(num, '(BODY[HEADER.FIELDS (FROM SUBJECT)] BODY[TEXT])')
-                            from_, subject, body = '', '', ''
-                            for part in msg_data:
-                                if isinstance(part, tuple):
-                                    raw = part[1].decode(errors='ignore')
-                                    if 'From:' in raw:
-                                        from_ = raw.split('From:')[-1].strip()
-                                    elif 'Subject:' in raw:
-                                        subject = raw.split('Subject:')[-1].strip()
-                                    else:
-                                        body = raw.strip()
-                            messages.append({'from': from_, 'subject': subject, 'body': body})
-                        per_account_messages[key] = messages
-                        print(f"[IDLE] {key} → {len(messages)} messages")
+                            typ, data = mail.search(None, 'UNSEEN')
+                            messages = []
+                            for num in data[0].split():
+                                typ, msg_data = mail.fetch(num, '(BODY[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID REFERENCES)] BODY[TEXT])')
+                                from_, subject, message_id, references, body = '', '', '', '', ''
+                                for part in msg_data:
+                                    if isinstance(part, tuple):
+                                        raw = part[1].decode(errors='ignore')
+                                        if 'From:' in raw:
+                                            from_ = raw.split('From:')[-1].strip()
+                                        elif 'Subject:' in raw:
+                                            subject = raw.split('Subject:')[-1].strip()
+                                        elif 'Message-ID:' in raw:
+                                            message_id = raw.split('Message-ID:')[-1].strip()
+                                        elif 'References:' in raw:
+                                            references = raw.split('References:')[-1].strip()
+                                        else:
+                                            body = raw.strip()
+                                messages.append({
+                                    'from': from_,
+                                    'subject': subject,
+                                    'message_id': message_id,
+                                    'references': references,
+                                    'body': body
+                                })
+                            per_account_messages[key] = messages
+                            print(f"[IDLE] {key} → {len(messages)} messages")
 
-                    else:
-                        # No changes, IDLE timeout — just restart
-                        mail.send(b"DONE\r\n")
-                        while True:
-                            if mail.readline().startswith(tag.encode()):
-                                break
+                        else:
+                            # No new mail, IDLE timeout
+                            mail.send(b"DONE\r\n")
+                            while True:
+                                if mail.readline().startswith(tag.encode()):
+                                    break
 
-        except Exception as e:
-            print(f"[IDLE ERROR] {key} failed: {e}, retrying in 15s")
-            await asyncio.sleep(15)
+                except Exception as e_inner:
+                    print(f"[IDLE INNER ERROR] {key} loop error: {e_inner}")
+                    # Gracefully continue to reconnect
+
+        except Exception as e_outer:
+            print(f"[IDLE ERROR] {key} failed to connect or login: {e_outer}")
+
+        print(f"[IDLE] {key} sleeping before retry...")
+        time.sleep(60)
 
 @app.route('/inbox')
 def inbox():
@@ -375,6 +386,7 @@ def reply():
     try:
         to_email = request.form['to']
         body = request.form['body']
+        original_subject = request.form.get('subject', '')  # Get original subject if available
         
         # Get an available account for sending
         account = get_available_account()
@@ -385,8 +397,31 @@ def reply():
         msg = MIMEMultipart()
         msg['From'] = account[1]  # email
         msg['To'] = to_email
-        msg['Subject'] = 'Re: Follow-up'
-        msg.attach(MIMEText(body, 'plain'))
+        
+        # Set proper threading headers
+        msg_id = f"<{uuid.uuid4()}@{account[1].split('@')[1]}>"
+        msg['Message-ID'] = msg_id
+        msg['In-Reply-To'] = request.form.get('message_id', '')  # Get original message ID if available
+        msg['References'] = request.form.get('references', '')  # Get original references if available
+        
+        # Set subject with proper threading
+        if original_subject:
+            if not original_subject.startswith('Re:'):
+                msg['Subject'] = f"Re: {original_subject}"
+            else:
+                msg['Subject'] = original_subject
+        else:
+            msg['Subject'] = 'Re: Follow-up'
+        
+        # Create the reply body with original message quoted
+        original_body = request.form.get('original_body', '')
+        if original_body:
+            quoted_body = f"\n\nOn {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, {to_email} wrote:\n> " + original_body.replace('\n', '\n> ')
+            full_body = body + quoted_body
+        else:
+            full_body = body
+            
+        msg.attach(MIMEText(full_body, 'plain'))
         
         # Send the email
         with smtplib.SMTP_SSL(account[2], account[3], timeout=10) as server:  # smtp_host, smtp_port
@@ -406,7 +441,7 @@ def reply():
         return redirect('/inbox')
     except Exception as e:
         print(f"[ERROR] Failed to send reply: {e}")
-        return f"Failed to send reply: {str(e)}", 500
+        return f"Failed to send reply: {str(e)}", 500 
 
 if __name__ == '__main__':
     # Start scheduler job
