@@ -298,12 +298,18 @@ def persistent_check_loop(host, port, user, pwd):
     key = f"{user}@{host}:{port}"
     print(f"[IDLE LOOP STARTED] {key} is now running in persistent IDLE mode.")
 
+    retry_delay = 10  # Initial retry delay in seconds
+    max_delay = 3600  # Max delay of 1 hour
+    
     while True:
         try:
-            with imaplib.IMAP4_SSL(host, port, timeout=30) as mail:
+            with imaplib.IMAP4_SSL(host, port) as mail:
                 mail.debug = 4
                 mail.login(user, pwd)
                 mail.select("inbox")
+
+                # Reset retry delay on successful connection
+                retry_delay = 60
 
                 try:
                     while True:
@@ -363,13 +369,16 @@ def persistent_check_loop(host, port, user, pwd):
 
                 except Exception as e_inner:
                     print(f"[IDLE INNER ERROR] {key} loop error: {e_inner}")
-                    # Gracefully continue to reconnect
+                    # Inner errors still use normal retry delay
+                    raise
 
         except Exception as e_outer:
             print(f"[IDLE ERROR] {key} failed to connect or login: {e_outer}")
-
-        print(f"[IDLE] {key} sleeping before retry...")
-        time.sleep(60)
+            print(f"[IDLE] {key} sleeping for {retry_delay} seconds before retry...")
+            time.sleep(retry_delay)
+            
+            # Exponential backoff with max delay
+            retry_delay = min(retry_delay * 2, max_delay)
 
 @app.route('/inbox')
 def inbox():
