@@ -18,6 +18,7 @@ import time
 import atexit
 import select
 import threading
+import email.utils  # Add this import at the top
 
 UPLOAD_FOLDER = 'uploads'
 DB_PATH = 'email_tool.db'
@@ -291,6 +292,7 @@ def background_inbox_fetch_parallel():
     def launch_all(accounts):
         for host, port, user, pwd in accounts:
             threading.Thread(target=persistent_check_loop, args=(host, port, user, pwd), daemon=True).start()
+            break # just to try 1
     
     threading.Thread(target=launch_all, args=(accounts,), daemon=True).start()
 
@@ -300,7 +302,7 @@ def persistent_check_loop(host, port, user, pwd):
 
     retry_delay = 10  # Initial retry delay in seconds
     max_delay = 3600  # Max delay of 1 hour
-    
+
     while True:
         try:
             with imaplib.IMAP4_SSL(host, port) as mail:
@@ -311,29 +313,92 @@ def persistent_check_loop(host, port, user, pwd):
                 # Reset retry delay on successful connection
                 retry_delay = 60
 
+                # Initially load all messages
+                typ, data = mail.search(None, 'ALL')
+                messages = []
+                for num in data[0].split():
+                    typ, msg_data = mail.fetch(num, '(BODY[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID REFERENCES)] BODY[TEXT])')
+                    from_, subject, message_id, references, body = '', '', '', '', ''
+                    for part in msg_data:
+                        if isinstance(part, tuple):
+                            raw = part[1].decode(errors='ignore')
+                            if 'From:' in raw:
+                                from_ = parse_email_address(raw.split('From:')[-1].strip())
+                            elif 'Subject:' in raw:
+                                subject = raw.split('Subject:')[-1].strip()
+                            elif 'Message-ID:' in raw:
+                                # Extract Message-ID properly
+                                message_id = raw.split('Message-ID:')[-1].strip()
+                                if message_id:
+                                    # Remove any whitespace and ensure proper format
+                                    message_id = message_id.strip()
+                                    if not message_id.startswith('<'):
+                                        message_id = f"<{message_id}>"
+                                    if not message_id.endswith('>'):
+                                        message_id = f"{message_id}>"
+                            elif 'References:' in raw:
+                                # Extract References properly
+                                references = raw.split('References:')[-1].strip()
+                                if references:
+                                    # Split into individual message IDs and clean them up
+                                    refs = [ref.strip() for ref in references.split()]
+                                    refs = [f"<{ref}>" if not ref.startswith('<') else ref for ref in refs]
+                                    refs = [ref if ref.endswith('>') else f"{ref}>" for ref in refs]
+                                    references = ' '.join(refs)
+                            else:
+                                # Try to extract Message-ID and References from the body if not found in headers
+                                body = raw.strip()
+                                if '--' in body:
+                                    # Look for boundary markers which often contain Message-IDs
+                                    boundaries = [b.strip() for b in body.split('--') if b.strip()]
+                                    if boundaries:
+                                        # The first boundary is usually the current message's ID
+                                        if not message_id:
+                                            current_id = boundaries[0].split('\n')[0].split()[0]
+                                            message_id = f"<{current_id}>"
+                                        
+                                        # Build References from all boundaries
+                                        if not references:
+                                            refs = []
+                                            for boundary in boundaries:
+                                                ref_id = boundary.split('\n')[0].split()[0]
+                                                refs.append(f"<{ref_id}>")
+                                            references = ' '.join(refs)
+                    messages.append({
+                        'from': from_,
+                        'subject': subject,
+                        'message_id': message_id,
+                        'references': references,
+                        'body': body
+                    })
+                per_account_messages[key] = messages
+                print(per_account_messages[key])
+                print(f"[INITIAL LOAD] {key} → {len(messages)} messages")
+
                 try:
                     while True:
                         print(f"[IDLE] {key} entering IDLE...")
                         tag = mail._new_tag()
                         mail.send(f"{tag} IDLE\r\n".encode())
+
                         if not mail.readline().startswith(b'+'):
                             raise Exception("IDLE not acknowledged")
 
-                        # Wait for change or timeout
                         if select.select([mail.sock], [], [], 1740)[0]:
                             print(f"[IDLE] {key} change detected!")
                             mail.send(b"DONE\r\n")
 
-                            # Flush full DONE response
+                            # Read until DONE acknowledged
                             while True:
                                 line = mail.readline()
-                                if line.startswith(tag.encode()):
+                                if b"Idle completed" in line:
                                     break
 
                             time.sleep(0.2)
 
+                            # Reload all messages when changes detected
                             typ, data = mail.search(None, 'UNSEEN')
-                            messages = []
+                            new_messages = []
                             for num in data[0].split():
                                 typ, msg_data = mail.fetch(num, '(BODY[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID REFERENCES)] BODY[TEXT])')
                                 from_, subject, message_id, references, body = '', '', '', '', ''
@@ -341,44 +406,63 @@ def persistent_check_loop(host, port, user, pwd):
                                     if isinstance(part, tuple):
                                         raw = part[1].decode(errors='ignore')
                                         if 'From:' in raw:
-                                            from_ = raw.split('From:')[-1].strip()
+                                            from_ = parse_email_address(raw.split('From:')[-1].strip())
                                         elif 'Subject:' in raw:
                                             subject = raw.split('Subject:')[-1].strip()
                                         elif 'Message-ID:' in raw:
+                                            # Extract Message-ID properly
                                             message_id = raw.split('Message-ID:')[-1].strip()
+                                            if message_id:
+                                                # Remove any whitespace and ensure proper format
+                                                message_id = message_id.strip()
+                                                if not message_id.startswith('<'):
+                                                    message_id = f"<{message_id}>"
+                                                if not message_id.endswith('>'):
+                                                    message_id = f"{message_id}>"
                                         elif 'References:' in raw:
+                                            # Extract References properly
                                             references = raw.split('References:')[-1].strip()
+                                            if references:
+                                                # Split into individual message IDs and clean them up
+                                                refs = [ref.strip() for ref in references.split()]
+                                                refs = [f"<{ref}>" if not ref.startswith('<') else ref for ref in refs]
+                                                refs = [ref if ref.endswith('>') else f"{ref}>" for ref in refs]
+                                                references = ' '.join(refs)
                                         else:
                                             body = raw.strip()
-                                messages.append({
+                                new_messages.append({
                                     'from': from_,
                                     'subject': subject,
                                     'message_id': message_id,
                                     'references': references,
                                     'body': body
                                 })
-                            per_account_messages[key] = messages
-                            print(f"[IDLE] {key} → {len(messages)} messages")
+
+                            # Only add messages that aren't already in the list
+                            existing_message_ids = {msg['message_id'] for msg in per_account_messages[key]}
+                            for msg in new_messages:
+                                if msg['message_id'] not in existing_message_ids:
+                                    per_account_messages[key].append(msg)
+                            print(f"[IDLE] {key} → Added {len(new_messages)} new messages")
 
                         else:
-                            # No new mail, IDLE timeout
+                            # IDLE timed out (29 mins), flush DONE
                             mail.send(b"DONE\r\n")
                             while True:
-                                if mail.readline().startswith(tag.encode()):
+                                line = mail.readline()
+                                if b"Idle completed" in line:
                                     break
 
                 except Exception as e_inner:
                     print(f"[IDLE INNER ERROR] {key} loop error: {e_inner}")
-                    # Inner errors still use normal retry delay
                     raise
 
         except Exception as e_outer:
             print(f"[IDLE ERROR] {key} failed to connect or login: {e_outer}")
             print(f"[IDLE] {key} sleeping for {retry_delay} seconds before retry...")
             time.sleep(retry_delay)
-            
-            # Exponential backoff with max delay
             retry_delay = min(retry_delay * 2, max_delay)
+
 
 @app.route('/inbox')
 def inbox():
@@ -390,17 +474,25 @@ def inbox():
     print(f"[INBOX] Returning {len(merged)} cached messages")
     return render_template_string(INBOX_TEMPLATE, messages=merged)
 
+    
 @app.route('/reply', methods=['POST'])
 def reply():
     try:
-        to_email = request.form['to']
+        print("[REPLY] Starting reply process...")
+        to_email = parse_email_address(request.form['to'])  # Use the helper function
         body = request.form['body']
-        original_subject = request.form.get('subject', '')  # Get original subject if available
+        original_subject = request.form.get('subject', '').split('\r\n')[0].strip()  # Get first line only
+        
+        print(f"[REPLY] Sending to: {to_email}")
+        print(f"[REPLY] Subject: {original_subject}")
         
         # Get an available account for sending
         account = get_available_account()
         if not account:
+            print("[REPLY] No available accounts found")
             return "No available email accounts. Please try again later.", 503
+            
+        print(f"[REPLY] Using account: {account[1]}")
             
         # Create the email message
         msg = MIMEMultipart()
@@ -408,10 +500,38 @@ def reply():
         msg['To'] = to_email
         
         # Set proper threading headers
-        msg_id = f"<{uuid.uuid4()}@{account[1].split('@')[1]}>"
-        msg['Message-ID'] = msg_id
-        msg['In-Reply-To'] = request.form.get('message_id', '')  # Get original message ID if available
-        msg['References'] = request.form.get('references', '')  # Get original references if available
+        msg_id = f"{uuid.uuid4()}@{account[1].split('@')[1]}"
+        msg['Message-ID'] = f"<{msg_id}>"
+        
+        # Clean up message ID and references
+        in_reply_to = request.form.get('message_id', '').split('\r\n')[0].strip()
+        references = request.form.get('references', '').split('\r\n')[0].strip()
+        
+        # Ensure Message-ID is properly formatted
+        if in_reply_to and not in_reply_to.startswith('<'):
+            in_reply_to = f"<{in_reply_to}>"
+        
+        # Build References header
+        if in_reply_to:
+            msg['In-Reply-To'] = in_reply_to
+            print(f"[REPLY] In-Reply-To: {in_reply_to}")
+            
+            # Combine References with In-Reply-To
+            if references:
+                # Split references into individual message IDs
+                refs = [ref.strip() for ref in references.split()]
+                # Clean up each reference
+                refs = [f"<{ref}>" if not ref.startswith('<') else ref for ref in refs]
+                refs = [ref if ref.endswith('>') else f"{ref}>" for ref in refs]
+                # Remove any non-message-id content
+                refs = [ref for ref in refs if ref.startswith('<') and ref.endswith('>')]
+                # Add the current In-Reply-To if not already in references
+                if in_reply_to not in refs:
+                    refs.append(in_reply_to)
+                msg['References'] = ' '.join(refs)
+            else:
+                msg['References'] = in_reply_to
+            print(f"[REPLY] References: {msg['References']}")
         
         # Set subject with proper threading
         if original_subject:
@@ -432,25 +552,50 @@ def reply():
             
         msg.attach(MIMEText(full_body, 'plain'))
         
+        print("[REPLY] Attempting to send email...")
         # Send the email
         with smtplib.SMTP_SSL(account[2], account[3], timeout=10) as server:  # smtp_host, smtp_port
+            print(f"[REPLY] Connected to SMTP server {account[2]}:{account[3]}")
             server.login(account[4], account[5])  # smtp_user, smtp_pass
+            print("[REPLY] Successfully logged in to SMTP server")
             server.send_message(msg)
+            print("[REPLY] Email sent successfully")
             
+        print("[REPLY] Updating database...")
         # Update account usage and mark email as replied
         with sqlite3.connect(DB_PATH) as conn:
             # Update account usage
             conn.execute("UPDATE accounts SET sent_today = sent_today + 1 WHERE id=?", (account[0],))
+            print(f"[REPLY] Updated sent_today count for account {account[0]}")
             
             # Mark the original email as replied
             conn.execute("UPDATE emails SET replied=1, replied_at=? WHERE email=?", 
                         (datetime.utcnow(), to_email))
             conn.commit()
+            print(f"[REPLY] Marked email {to_email} as replied")
             
+        print("[REPLY] Reply process completed successfully")
         return redirect('/inbox')
     except Exception as e:
-        print(f"[ERROR] Failed to send reply: {e}")
-        return f"Failed to send reply: {str(e)}", 500 
+        print(f"[REPLY ERROR] Failed to send reply: {e}")
+        print(f"[REPLY ERROR] Full error details: {traceback.format_exc()}")
+        return f"Failed to send reply: {str(e)}", 500
+
+def parse_email_address(addr_str):
+    """Parse an email address string into a clean email address."""
+    if not addr_str:
+        return ''
+    try:
+        # Try to parse using email.utils
+        name, addr = email.utils.parseaddr(addr_str)
+        if addr:
+            return addr
+        # If that fails, try to extract from common formats
+        if '<' in addr_str and '>' in addr_str:
+            return addr_str.split('<')[-1].split('>')[0].strip()
+        return addr_str.strip()
+    except:
+        return addr_str.strip()
 
 if __name__ == '__main__':
     # Start scheduler job

@@ -4,7 +4,7 @@ import base64
 imaplib.Commands['AUTH'] = ('AUTH', 'AUTHENTICATE', 'SELECT')  # override if needed
 
 host = "..."
-port = "..."
+port = 993
 user = "..."
 pwd = "..."
 
