@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto p-6">
+    <h1 class="text-2xl font-bold mb-6">Email Campaign Dashboard</h1>
+
+    <!-- Overall Stats -->
+    <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+        <h2 class="text-xl font-semibold mb-4">Overall Statistics</h2>
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div class="bg-blue-50 p-4 rounded-lg">
+                <h3 class="text-sm font-medium text-blue-800">Total Emails</h3>
+                <p class="text-2xl font-bold text-blue-600">{{ total }}</p>
+            </div>
+            <div class="bg-green-50 p-4 rounded-lg">
+                <h3 class="text-sm font-medium text-green-800">Sent</h3>
+                <p class="text-2xl font-bold text-green-600">{{ sent }}</p>
+            </div>
+            <div class="bg-yellow-50 p-4 rounded-lg">
+                <h3 class="text-sm font-medium text-yellow-800">Opened</h3>
+                <p class="text-2xl font-bold text-yellow-600">{{ opened }}</p>
+            </div>
+            <div class="bg-purple-50 p-4 rounded-lg">
+                <h3 class="text-sm font-medium text-purple-800">Replied</h3>
+                <p class="text-2xl font-bold text-purple-600">{{ replied }}</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Campaign Stats -->
+    <div class="bg-white rounded-lg shadow-md p-6">
+        <h2 class="text-xl font-semibold mb-4">Campaign Statistics</h2>
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Campaign Name</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Created</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Sent</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Opened</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Replied</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    {% for campaign in campaigns %}
+                    <tr>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{{ campaign[1] }}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ campaign[2] }}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ campaign[3] }}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ campaign[4] }}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ campaign[5] }}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ campaign[6] }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %} 

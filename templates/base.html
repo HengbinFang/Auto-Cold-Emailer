@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Tool</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <header class="mb-8">
+            <h1 class="text-3xl font-bold text-gray-800">Email Tool</h1>
+            <nav class="mt-4">
+                <a href="/" class="text-blue-600 hover:text-blue-800 mr-4">Home</a>
+                <a href="/dashboard" class="text-blue-600 hover:text-blue-800 mr-4">Dashboard</a>
+                <a href="/inbox" class="text-blue-600 hover:text-blue-800">Inbox</a>
+            </nav>
+        </header>
+        <main>
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+</body>
+</html> 

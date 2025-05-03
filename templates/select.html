@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="max-w-2xl mx-auto p-6">
+    <h1 class="text-2xl font-bold mb-6">Select Columns</h1>
+    
+    <form method="POST" action="/select" class="space-y-6">
+        <div class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium text-gray-700">Campaign Name</label>
+                <input type="text" name="campaign_name" 
+                       class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                       placeholder="Enter campaign name (optional)">
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium text-gray-700">Email Column</label>
+                <select name="email_col" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                    <option value="">Select email column</option>
+                    {% for col in cols %}
+                    <option value="{{ col }}">{{ col }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium text-gray-700">Subject Column</label>
+                <select name="subject_col" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                    <option value="">Select subject column (optional)</option>
+                    {% for col in cols %}
+                    <option value="{{ col }}">{{ col }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium text-gray-700">Message Column</label>
+                <select name="msg_col" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                    <option value="">Select message column</option>
+                    {% for col in cols %}
+                    <option value="{{ col }}">{{ col }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+        
+        <input type="hidden" name="filename" value="{{ filename }}">
+        
+        <div class="flex justify-end">
+            <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2">
+                Start Campaign
+            </button>
+        </div>
+    </form>
+</div>
+{% endblock %} 

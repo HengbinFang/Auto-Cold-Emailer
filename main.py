@@ -9,7 +9,7 @@ import base64
 from datetime import datetime, timedelta, date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from flask import Flask, request, redirect, render_template_string, jsonify, send_file
+from flask import Flask, request, redirect, render_template, jsonify, send_file
 from apscheduler.schedulers.background import BackgroundScheduler
 from werkzeug.utils import secure_filename
 import uuid
@@ -18,12 +18,18 @@ import time
 import atexit
 import select
 import threading
-import email.utils  # Add this import at the top
+import email.utils
+import random
 
 UPLOAD_FOLDER = 'uploads'
 DB_PATH = 'email_tool.db'
 TRACKING_PIXEL_PATH = 'pixel.png'
-SEND_INTERVAL_MINUTES = 10  # will stagger every 10 min, rotating accounts
+SEND_INTERVAL_MINUTES = 10  # base interval for each email
+MIN_WAIT_MINUTES = 5  # minimum wait time
+MAX_WAIT_MINUTES = 15  # maximum wait time
+
+# Global variable for storing per-account messages
+per_account_messages = {}
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -32,77 +38,35 @@ scheduler.start()
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Templates
-
-UPLOAD_TEMPLATE = '''
-<h2>Upload Recipient CSV</h2>
-<form method="post" enctype="multipart/form-data">
-  <input type="file" name="file">
-  <input type="submit" value="Upload Recipients CSV">
-</form>
-<br>
-<h2>Upload Account CSV</h2>
-<form method="post" enctype="multipart/form-data" action="/accounts_upload">
-  <input type="file" name="file">
-  <input type="submit" value="Upload Accounts CSV">
-</form>
-'''
-SELECT_TEMPLATE = '''
-<h2>Select Columns</h2>
-<form method="post" action="/select">
-  <input type="hidden" name="filename" value="{{ filename }}">
-  <label for="email_col">Email Column:</label>
-  <select name="email_col">{% for col in cols %}<option>{{ col }}</option>{% endfor %}</select><br>
-  <label for="msg_col">Message Column:</label>
-  <select name="msg_col">{% for col in cols %}<option>{{ col }}</option>{% endfor %}</select><br>
-  <input type="submit" value="Start Sending">
-</form>
-'''
-
-INBOX_TEMPLATE = '''
-<h2>Inbox</h2>
-{% for msg in messages %}
-  <div style="border:1px solid #ccc; padding:10px; margin-bottom:10px;">
-    <p><b>From:</b> {{ msg['from'] }}</p>
-    <p><b>Subject:</b> {{ msg['subject'] }}</p>
-    <p><b>Body:</b> {{ msg['body'] }}</p>
-    <form method="post" action="/reply">
-      <input type="hidden" name="to" value="{{ msg['from'] }}">
-      <input type="hidden" name="subject" value="{{ msg['subject'] }}">
-      <input type="hidden" name="message_id" value="{{ msg['message_id'] }}">
-      <input type="hidden" name="references" value="{{ msg['references'] }}">
-      <input type="hidden" name="original_body" value="{{ msg['body'] }}">
-      <textarea name="body" placeholder="Your reply..." style="width: 100%; height: 100px;"></textarea>
-      <input type="submit" value="Reply">
-    </form>
-  </div>
-{% endfor %}
-'''
-
-# Create the scheduler
-scheduler = BackgroundScheduler()
-
-all_messages = []
-imap_blacklist = {}
-BLACKLIST_DURATION = 3600
-
-# Stores active message lists per inbox
-per_account_messages = {}
-
 # Database setup
 with sqlite3.connect(DB_PATH) as conn:
+    # Create campaigns table
+    conn.execute('''CREATE TABLE IF NOT EXISTS campaigns (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # Create emails table with campaign_id
     conn.execute('''CREATE TABLE IF NOT EXISTS emails (
         id INTEGER PRIMARY KEY,
         uid TEXT,
         email TEXT,
+        subject TEXT,
         message TEXT,
         sent_at TIMESTAMP,
         opened INTEGER DEFAULT 0,
         opened_at TIMESTAMP,
         replied INTEGER DEFAULT 0,
         replied_at TIMESTAMP,
-        account_email TEXT
+        account_email TEXT,
+        next_send_time TIMESTAMP,
+        is_sending INTEGER DEFAULT 0,
+        campaign_id INTEGER,
+        FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
     )''')
+    
+    # Create accounts table
     conn.execute('''CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY,
         email TEXT UNIQUE,
@@ -118,53 +82,96 @@ with sqlite3.connect(DB_PATH) as conn:
         last_sent DATE,
         sent_today INTEGER DEFAULT 0
     )''')
+    
+    # Add campaign_id column if it doesn't exist
+    try:
+        conn.execute("ALTER TABLE emails ADD COLUMN campaign_id INTEGER")
+        
+        # Create a default campaign for existing emails
+        cursor = conn.execute("INSERT INTO campaigns (name) VALUES (?)", 
+                            ("Default Campaign",))
+        default_campaign_id = cursor.lastrowid
+        
+        # Update existing emails to belong to the default campaign
+        conn.execute("UPDATE emails SET campaign_id = ? WHERE campaign_id IS NULL", 
+                    (default_campaign_id,))
+    except sqlite3.OperationalError:
+        # Column already exists, ignore error
+        pass
+    
     conn.commit()
 
 @app.route('/', methods=['GET', 'POST'])
 def upload():
     if request.method == 'POST':
-        if 'file' not in request.files or request.files['file'].filename == '':
+        print("[DEBUG] Request files:", request.files)
+        print("[DEBUG] Request form:", request.form)
+        if 'file' not in request.files:
+            print("[DEBUG] No file in request.files")
             return "No file uploaded", 400
         file = request.files['file']
+        if file.filename == '':
+            print("[DEBUG] Empty filename")
+            return "No file uploaded", 400
+        print("[DEBUG] File:", file)
+        print("[DEBUG] Filename:", file.filename)
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+        file.save(filepath)  # Save the file immediately
         with open(filepath, newline='', encoding='utf-8-sig') as csvfile:  # handles BOM
             reader = csv.reader(csvfile)
             headers = next(reader)
-        return render_template_string(SELECT_TEMPLATE, cols=headers, filename=filename)
-    return render_template_string(UPLOAD_TEMPLATE)
+        return render_template('select.html', cols=headers, filename=filename)
+    return render_template('upload.html')
 
 @app.route('/select', methods=['POST'])
 def select_columns():
-    email_col = request.form['email_col']
-    msg_col = request.form['msg_col']
-    filename = request.form['filename']
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    try:
+        email_col = request.form['email_col']
+        subject_col = request.form['subject_col']
+        msg_col = request.form['msg_col']
+        filename = request.form['filename']
+        campaign_name = request.form.get('campaign_name', f"Campaign {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
 
-    inserted = 0
-    with open(filepath, newline='', encoding='utf-8-sig') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            uid = str(uuid.uuid4())
-            email = row.get(email_col)
-            msg = row.get(msg_col)
-            if not email or not msg:
-                continue
+        # Create new campaign
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute("INSERT INTO campaigns (name) VALUES (?)", (campaign_name,))
+            campaign_id = cursor.lastrowid
+            conn.commit()
+
+        inserted = 0
+        with open(filepath, newline='', encoding='utf-8-sig') as csvfile:
+            reader = csv.DictReader(csvfile)
+            rows = list(reader)  # Read all rows first
+            
+            # Get number of available accounts
             with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("INSERT INTO emails (uid, email, message) VALUES (?, ?, ?)", (uid, email, msg))
-                conn.commit()
-                inserted += 1
+                available_accounts = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+            
+            for i, row in enumerate(rows):
+                uid = str(uuid.uuid4())
+                email = row.get(email_col)
+                subject = row.get(subject_col) if subject_col else None  # Make subject optional
+                msg = row.get(msg_col)
+                if not email or not msg:
+                    continue
+                
+                # Calculate which batch this email is in
+                batch_number = i // available_accounts
+                next_send_time = datetime.utcnow() + timedelta(minutes=batch_number * SEND_INTERVAL_MINUTES)
+                
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("INSERT INTO emails (uid, email, subject, message, next_send_time, campaign_id) VALUES (?, ?, ?, ?, ?, ?)", 
+                               (uid, email, subject, msg, next_send_time, campaign_id))
+                    conn.commit()
+                    inserted += 1
 
-    print(f"[SELECT] Inserted {inserted} emails into queue")
-
-    if inserted > 0:
-        print("[SCHEDULER] Starting staggered sending task")
-        scheduler.add_job(send_next_email, 'interval', minutes=SEND_INTERVAL_MINUTES, id='send_task', replace_existing=True)
-    else:
-        print("[SELECT] No emails to insert. Scheduler not started.")
-
-    return redirect('/dashboard')
+        print(f"[SELECT] Inserted {inserted} emails into queue for campaign {campaign_name}")
+        return redirect('/dashboard')
+    except Exception as e:
+        print(f"[ERROR] Failed to process file: {e}")
+        return f"Error processing file: {str(e)}", 500
 
 @app.route('/accounts_upload', methods=['POST'])
 def upload_accounts():
@@ -193,8 +200,7 @@ def upload_accounts():
             conn.commit()
     return "Accounts uploaded."
 
-
-def get_available_account():
+def get_available_accounts():
     today = date.today()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute('''SELECT * FROM accounts
@@ -202,60 +208,76 @@ def get_available_account():
                                ORDER BY sent_today ASC''', (today,)).fetchall()
         if not rows:
             return None
-        account = rows[0]
-        if account[11] != today:
-            conn.execute("UPDATE accounts SET last_sent=?, sent_today=0 WHERE id=?", (today, account[0]))
-            conn.commit()
-        return account
-    
-# inside send_next_email()
+        
+        # Update last_sent date for accounts that need it
+        for account in rows:
+            if account[11] != today:
+                conn.execute("UPDATE accounts SET last_sent=?, sent_today=0 WHERE id=?", (today, account[0]))
+        conn.commit()
+        
+        return rows
+
 def send_next_email():
     print("[SCHEDULER] Checking for unsent emails...")
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT id, uid, email, message FROM emails WHERE sent_at IS NULL LIMIT 1").fetchone()
-        if not row:
-            print("[SCHEDULER] No unsent emails found.")
+        # Get all available accounts
+        accounts = get_available_accounts()
+        if not accounts:
+            print("[SCHEDULER] No available accounts with quota.")
             return
-        id_, uid, to_email, message = row
 
-        account = get_available_account()
-        if not account:
-            print("[SCHEDULER] No available account with quota.")
-            return
-        
-        print("[DEBUG] Using account:", account)
+        # For each available account, try to send one email
+        for account in accounts:
+            # Get the next email that's ready to send
+            now = datetime.utcnow()
+            row = conn.execute('''SELECT id, uid, email, subject, message FROM emails 
+                                WHERE sent_at IS NULL 
+                                AND next_send_time <= ? 
+                                AND is_sending = 0
+                                LIMIT 1''', (now,)).fetchone()
+            
+            if not row:
+                continue
 
-        smtp_host = account[2]
-        smtp_port = account[3]
-        smtp_user = account[4]
-        smtp_pass = account[5]
-
-
-        full_msg = MIMEMultipart("alternative")
-        full_msg['Subject'] = "Hello from Hengbin"
-        full_msg['From'] = account[1]
-        full_msg['To'] = to_email
-        html_msg = f"{message}<img src='http://localhost:5000/pixel.gif?uid={uid}' width='1' height='1'>"
-        full_msg.attach(MIMEText(html_msg, 'html'))
-
-        try:
-            print(f"[SEND] Attempting to send to {to_email} using {account[1]} ({smtp_host}:{smtp_port})")
-            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10) as server:
-                server.set_debuglevel(1)  # ← this will show raw SMTP handshake
-                print("Connected. Logging in...")
-                server.login(smtp_user, smtp_pass)
-                print("Logged in.")
-                server.send_message(full_msg)
-
-            conn.execute(
-                "UPDATE emails SET sent_at=?, account_email=? WHERE id=?",
-                (datetime.utcnow(), account[1], id_)
-            )
-            conn.execute("UPDATE accounts SET sent_today = sent_today + 1 WHERE id=?", (account[0],))
+            id_, uid, to_email, subject, message = row
+            
+            # Mark email as being sent to prevent duplicate sends
+            conn.execute("UPDATE emails SET is_sending = 1 WHERE id = ?", (id_,))
             conn.commit()
-            print(f"[SUCCESS] Sent to {to_email}")
-        except Exception as e:
-            print(f"[ERROR] Failed to send to {to_email} via {account[1]}: {e}")
+
+            smtp_host = account[2]
+            smtp_port = account[3]
+            smtp_user = account[4]
+            smtp_pass = account[5]
+
+            full_msg = MIMEMultipart("alternative")
+            full_msg['Subject'] = subject or "Hello from Hengbin"
+            full_msg['From'] = account[1]
+            full_msg['To'] = to_email
+            html_msg = f"{message}<img src='http://localhost:5000/pixel.gif?uid={uid}' width='1' height='1'>"
+            full_msg.attach(MIMEText(html_msg, 'html'))
+
+            try:
+                print(f"[SEND] Attempting to send to {to_email} using {account[1]} ({smtp_host}:{smtp_port})")
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10) as server:
+                    server.set_debuglevel(1)
+                    print("Connected. Logging in...")
+                    server.login(smtp_user, smtp_pass)
+                    print("Logged in.")
+                    server.send_message(full_msg)
+
+                conn.execute(
+                    "UPDATE emails SET sent_at=?, account_email=?, is_sending=0 WHERE id=?",
+                    (now, account[1], id_)
+                )
+                conn.execute("UPDATE accounts SET sent_today = sent_today + 1 WHERE id=?", (account[0],))
+                conn.commit()
+                print(f"[SUCCESS] Sent to {to_email}")
+            except Exception as e:
+                print(f"[ERROR] Failed to send to {to_email} via {account[1]}: {e}")
+                # Reset is_sending flag on error
+                conn.execute("UPDATE emails SET is_sending = 0 WHERE id = ?", (id_,))
+                conn.commit()
 
 # (You can add 'account_email' field in the inbox/reply tracking if needed)
 @app.route('/pixel.gif')
@@ -263,25 +285,49 @@ def tracking_pixel():
     uid = request.args.get('uid')
     if uid:
         with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("UPDATE emails SET opened=1, opened_at=? WHERE uid=?", (datetime.utcnow(), uid))
-            conn.commit()
+            # Check if this email belongs to a campaign and hasn't been opened yet
+            cursor = conn.execute('''SELECT id, campaign_id FROM emails 
+                                  WHERE uid=? AND sent_at IS NOT NULL 
+                                  AND opened=0''', (uid,))
+            result = cursor.fetchone()
+            
+            if result:
+                email_id, campaign_id = result
+                # Only mark as opened if it belongs to a campaign
+                if campaign_id:
+                    conn.execute("UPDATE emails SET opened=1, opened_at=? WHERE id=?", 
+                               (datetime.utcnow(), email_id))
+                    conn.commit()
+                    print(f"[OPEN DETECTED] Email {email_id} from campaign {campaign_id} was opened")
     return send_file(TRACKING_PIXEL_PATH, mimetype='image/gif')
 
 @app.route('/dashboard')
 def dashboard():
     with sqlite3.connect(DB_PATH) as conn:
+        # Get all campaigns with their stats
+        campaigns = conn.execute('''SELECT 
+            c.id, c.name, c.created_at,
+            COUNT(e.id) as total,
+            SUM(CASE WHEN e.sent_at IS NOT NULL THEN 1 ELSE 0 END) as sent,
+            SUM(e.opened) as opened,
+            SUM(e.replied) as replied
+            FROM campaigns c
+            LEFT JOIN emails e ON c.id = e.campaign_id
+            GROUP BY c.id
+            ORDER BY c.created_at DESC''').fetchall()
+        
+        # Get overall stats
         total = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
         sent = conn.execute("SELECT COUNT(*) FROM emails WHERE sent_at IS NOT NULL").fetchone()[0]
         opened = conn.execute("SELECT COUNT(*) FROM emails WHERE opened=1").fetchone()[0]
         replied = conn.execute("SELECT COUNT(*) FROM emails WHERE replied=1").fetchone()[0]
-    return f"""
-    <h2>Dashboard</h2>
-    <p>Total: {total}</p>
-    <p>Sent: {sent}</p>
-    <p>Opened: {opened} ({(opened/sent*100 if sent else 0):.2f}%)</p>
-    <p>Replied: {replied} ({(replied/sent*100 if sent else 0):.2f}%)</p>
-    <a href='/inbox'>View Inbox</a>
-    """
+    
+    return render_template('dashboard.html', 
+                         campaigns=campaigns,
+                         total=total,
+                         sent=sent,
+                         opened=opened,
+                         replied=replied)
 
 def background_inbox_fetch_parallel():
     import sqlite3
@@ -296,6 +342,11 @@ def background_inbox_fetch_parallel():
     
     threading.Thread(target=launch_all, args=(accounts,), daemon=True).start()
 
+"""
+Haha quick note im not using it right now though. The inbox.
+Inbox reply feature not exactly working atm.
+Just going to try thunderbird for now.
+"""
 def persistent_check_loop(host, port, user, pwd):
     key = f"{user}@{host}:{port}"
     print(f"[IDLE LOOP STARTED] {key} is now running in persistent IDLE mode.")
@@ -327,43 +378,41 @@ def persistent_check_loop(host, port, user, pwd):
                             elif 'Subject:' in raw:
                                 subject = raw.split('Subject:')[-1].strip()
                             elif 'Message-ID:' in raw:
-                                # Extract Message-ID properly
                                 message_id = raw.split('Message-ID:')[-1].strip()
                                 if message_id:
-                                    # Remove any whitespace and ensure proper format
                                     message_id = message_id.strip()
                                     if not message_id.startswith('<'):
                                         message_id = f"<{message_id}>"
                                     if not message_id.endswith('>'):
                                         message_id = f"{message_id}>"
                             elif 'References:' in raw:
-                                # Extract References properly
                                 references = raw.split('References:')[-1].strip()
                                 if references:
-                                    # Split into individual message IDs and clean them up
                                     refs = [ref.strip() for ref in references.split()]
                                     refs = [f"<{ref}>" if not ref.startswith('<') else ref for ref in refs]
                                     refs = [ref if ref.endswith('>') else f"{ref}>" for ref in refs]
                                     references = ' '.join(refs)
                             else:
-                                # Try to extract Message-ID and References from the body if not found in headers
                                 body = raw.strip()
-                                if '--' in body:
-                                    # Look for boundary markers which often contain Message-IDs
-                                    boundaries = [b.strip() for b in body.split('--') if b.strip()]
-                                    if boundaries:
-                                        # The first boundary is usually the current message's ID
-                                        if not message_id:
-                                            current_id = boundaries[0].split('\n')[0].split()[0]
-                                            message_id = f"<{current_id}>"
-                                        
-                                        # Build References from all boundaries
-                                        if not references:
-                                            refs = []
-                                            for boundary in boundaries:
-                                                ref_id = boundary.split('\n')[0].split()[0]
-                                                refs.append(f"<{ref_id}>")
-                                            references = ' '.join(refs)
+                    
+                    # Check if this is a reply to one of our campaign emails
+                    if references:  # If this email references our previous emails
+                        with sqlite3.connect(DB_PATH) as conn:
+                            # Look up the original email by its message ID in the references
+                            for ref in references.split():
+                                cursor = conn.execute('''SELECT id, campaign_id FROM emails 
+                                                      WHERE uid=? AND sent_at IS NOT NULL 
+                                                      AND replied=0''', (ref.strip('<>'),))
+                                result = cursor.fetchone()
+                                if result:
+                                    email_id, campaign_id = result
+                                    # Mark the original email as replied
+                                    conn.execute('''UPDATE emails SET replied=1, replied_at=? 
+                                                  WHERE id=?''', (datetime.utcnow(), email_id))
+                                    conn.commit()
+                                    print(f"[REPLY DETECTED] Email {email_id} from campaign {campaign_id} was replied to by {from_}")
+                                    break
+
                     messages.append({
                         'from': from_,
                         'subject': subject,
@@ -372,7 +421,6 @@ def persistent_check_loop(host, port, user, pwd):
                         'body': body
                     })
                 per_account_messages[key] = messages
-                print(per_account_messages[key])
                 print(f"[INITIAL LOAD] {key} → {len(messages)} messages")
 
                 try:
@@ -410,26 +458,41 @@ def persistent_check_loop(host, port, user, pwd):
                                         elif 'Subject:' in raw:
                                             subject = raw.split('Subject:')[-1].strip()
                                         elif 'Message-ID:' in raw:
-                                            # Extract Message-ID properly
                                             message_id = raw.split('Message-ID:')[-1].strip()
                                             if message_id:
-                                                # Remove any whitespace and ensure proper format
                                                 message_id = message_id.strip()
                                                 if not message_id.startswith('<'):
                                                     message_id = f"<{message_id}>"
                                                 if not message_id.endswith('>'):
                                                     message_id = f"{message_id}>"
                                         elif 'References:' in raw:
-                                            # Extract References properly
                                             references = raw.split('References:')[-1].strip()
                                             if references:
-                                                # Split into individual message IDs and clean them up
                                                 refs = [ref.strip() for ref in references.split()]
                                                 refs = [f"<{ref}>" if not ref.startswith('<') else ref for ref in refs]
                                                 refs = [ref if ref.endswith('>') else f"{ref}>" for ref in refs]
                                                 references = ' '.join(refs)
                                         else:
                                             body = raw.strip()
+                                
+                                # Check if this is a reply to one of our campaign emails
+                                if references:  # If this email references our previous emails
+                                    with sqlite3.connect(DB_PATH) as conn:
+                                        # Look up the original email by its message ID in the references
+                                        for ref in references.split():
+                                            cursor = conn.execute('''SELECT id, campaign_id FROM emails 
+                                                                  WHERE uid=? AND sent_at IS NOT NULL 
+                                                                  AND replied=0''', (ref.strip('<>'),))
+                                            result = cursor.fetchone()
+                                            if result:
+                                                email_id, campaign_id = result
+                                                # Mark the original email as replied
+                                                conn.execute('''UPDATE emails SET replied=1, replied_at=? 
+                                                              WHERE id=?''', (datetime.utcnow(), email_id))
+                                                conn.commit()
+                                                print(f"[REPLY DETECTED] Email {email_id} from campaign {campaign_id} was replied to by {from_}")
+                                                break
+
                                 new_messages.append({
                                     'from': from_,
                                     'subject': subject,
@@ -472,7 +535,7 @@ def inbox():
     for batch in per_account_messages.values():
         merged.extend(batch)
     print(f"[INBOX] Returning {len(merged)} cached messages")
-    return render_template_string(INBOX_TEMPLATE, messages=merged)
+    return render_template('inbox.html', messages=merged)
 
     
 @app.route('/reply', methods=['POST'])
@@ -562,17 +625,11 @@ def reply():
             print("[REPLY] Email sent successfully")
             
         print("[REPLY] Updating database...")
-        # Update account usage and mark email as replied
+        # Update account usage
         with sqlite3.connect(DB_PATH) as conn:
-            # Update account usage
             conn.execute("UPDATE accounts SET sent_today = sent_today + 1 WHERE id=?", (account[0],))
-            print(f"[REPLY] Updated sent_today count for account {account[0]}")
-            
-            # Mark the original email as replied
-            conn.execute("UPDATE emails SET replied=1, replied_at=? WHERE email=?", 
-                        (datetime.utcnow(), to_email))
             conn.commit()
-            print(f"[REPLY] Marked email {to_email} as replied")
+            print(f"[REPLY] Updated sent_today count for account {account[0]}")
             
         print("[REPLY] Reply process completed successfully")
         return redirect('/inbox')
@@ -599,6 +656,7 @@ def parse_email_address(addr_str):
 
 if __name__ == '__main__':
     # Start scheduler job
+    scheduler.add_job(send_next_email, 'interval', minutes=1, id='send_task')
     background_inbox_fetch_parallel()  # Only run once
 
     # send_next_email()
