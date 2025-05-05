@@ -20,6 +20,7 @@ import select
 import threading
 import email.utils
 import random
+import re
 
 UPLOAD_FOLDER = 'uploads'
 DB_PATH = 'email_tool.db'
@@ -63,9 +64,11 @@ with sqlite3.connect(DB_PATH) as conn:
         next_send_time TIMESTAMP,
         is_sending INTEGER DEFAULT 0,
         campaign_id INTEGER,
+        message_id TEXT,
         FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
     )''')
     
+
     # Create accounts table
     conn.execute('''CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY,
@@ -115,7 +118,12 @@ def upload():
             return "No file uploaded", 400
         print("[DEBUG] File:", file)
         print("[DEBUG] Filename:", file.filename)
-        filename = secure_filename(file.filename)
+        
+        # Add timestamp to filename to prevent duplicates
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_name, ext = os.path.splitext(secure_filename(file.filename))
+        filename = f"{base_name}_{timestamp}{ext}"
+        
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)  # Save the file immediately
         with open(filepath, newline='', encoding='utf-8-sig') as csvfile:  # handles BOM
@@ -132,10 +140,11 @@ def select_columns():
         msg_col = request.form['msg_col']
         filename = request.form['filename']
         campaign_name = request.form.get('campaign_name', f"Campaign {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        enable_tracking = request.form.get('enable_tracking', 'on') == 'on'  # Default to on if not specified
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
 
         # Create new campaign
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH) as conn: 
             cursor = conn.execute("INSERT INTO campaigns (name) VALUES (?)", (campaign_name,))
             campaign_id = cursor.lastrowid
             conn.commit()
@@ -157,6 +166,11 @@ def select_columns():
                 if not email or not msg:
                     continue
                 
+                # Add tracking pixel if enabled
+                if enable_tracking:
+                    tracking_pixel = f'<img src=".../pixel.gif?uid={uid}" width="1" height="1">'
+                    msg = f"{msg}\n{tracking_pixel}"
+                
                 # Calculate which batch this email is in
                 batch_number = i // available_accounts
                 next_send_time = datetime.utcnow() + timedelta(minutes=batch_number * SEND_INTERVAL_MINUTES)
@@ -176,7 +190,11 @@ def select_columns():
 @app.route('/accounts_upload', methods=['POST'])
 def upload_accounts():
     file = request.files['file']
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file.filename))
+    # Add timestamp to filename to prevent duplicates
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    base_name, ext = os.path.splitext(secure_filename(file.filename))
+    filename = f"{base_name}_{timestamp}{ext}"
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
     with open(filepath, newline='', encoding='utf-8-sig') as csvfile:
         reader = csv.DictReader(csvfile)
@@ -227,6 +245,8 @@ def send_next_email():
             return
 
         # For each available account, try to send one email
+        accounts = [accounts[2]]
+        print(accounts)
         for account in accounts:
             # Get the next email that's ready to send
             now = datetime.utcnow()
@@ -254,7 +274,12 @@ def send_next_email():
             full_msg['Subject'] = subject or "Hello from Hengbin"
             full_msg['From'] = account[1]
             full_msg['To'] = to_email
-            html_msg = f"{message}<img src='http://localhost:5000/pixel.gif?uid={uid}' width='1' height='1'>"
+            
+            # Generate a proper Message-ID
+            msg_id = f"{uuid.uuid4()}@{account[1].split('@')[1]}"
+            full_msg['Message-ID'] = f"<{msg_id}>"
+            
+            html_msg = message
             full_msg.attach(MIMEText(html_msg, 'html'))
 
             try:
@@ -267,8 +292,8 @@ def send_next_email():
                     server.send_message(full_msg)
 
                 conn.execute(
-                    "UPDATE emails SET sent_at=?, account_email=?, is_sending=0 WHERE id=?",
-                    (now, account[1], id_)
+                    "UPDATE emails SET sent_at=?, account_email=?, is_sending=0, message_id=? WHERE id=?",
+                    (now, account[1], msg_id, id_)
                 )
                 conn.execute("UPDATE accounts SET sent_today = sent_today + 1 WHERE id=?", (account[0],))
                 conn.commit()
@@ -337,16 +362,102 @@ def background_inbox_fetch_parallel():
     
     def launch_all(accounts):
         for host, port, user, pwd in accounts:
-            threading.Thread(target=persistent_check_loop, args=(host, port, user, pwd), daemon=True).start()
-            break # just to try 1
+            if user == "...":
+                threading.Thread(target=persistent_check_loop, args=(host, port, user, pwd), daemon=True).start()
+                break # just to try 1
     
     threading.Thread(target=launch_all, args=(accounts,), daemon=True).start()
 
-"""
-Haha quick note im not using it right now though. The inbox.
-Inbox reply feature not exactly working atm.
-Just going to try thunderbird for now.
-"""
+def parse_email_message(msg_data):
+    """Helper function to parse email message data into a structured format."""
+    from_, subject, message_id, references, body = '', '', '', '', ''
+    print(f"[EMAIL PARSING] Raw message data: {msg_data}")
+    
+    for part in msg_data:
+        if isinstance(part, tuple):
+            raw = part[1].decode(errors='ignore')
+            print(f"[EMAIL PARSING] Raw header part: {raw}")
+            
+            # Check each header separately
+            if 'From:' in raw:
+                from_ = parse_email_address(raw.split('From:')[-1].strip())
+                print(f"[EMAIL PARSING] Found From: {from_}")
+            
+            if 'Subject:' in raw:
+                subject = raw.split('Subject:')[-1].strip()
+                print(f"[EMAIL PARSING] Found Subject: {subject}")
+            
+            if 'Message-ID:' in raw:
+                message_id = raw.split('Message-ID:')[-1].strip()
+                if message_id:
+                    message_id = message_id.strip()
+                    if not message_id.startswith('<'):
+                        message_id = f"<{message_id}>"
+                    if not message_id.endswith('>'):
+                        message_id = f"{message_id}>"
+                print(f"[EMAIL PARSING] Found Message-ID: {message_id}")
+            
+            if 'References:' in raw:
+                references = raw.split('References:')[-1].strip()
+                print(f"[EMAIL PARSING] Found References header: {references}")
+                if references:
+                    # Extract only message IDs (text between < and >)
+                    refs = re.findall(r'<([^>]+)>', references)
+                    # Clean up each reference
+                    refs = [f"<{ref}>" if not ref.startswith('<') else ref for ref in refs]
+                    refs = [ref if ref.endswith('>') else f"{ref}>" for ref in refs]
+                    references = ' '.join(refs)
+                    print(f"[EMAIL PARSING] Processed References: {references}")
+                    print(f"[EMAIL PARSING] References list: {refs}")
+            
+            if not any(header in raw for header in ['From:', 'Subject:', 'Message-ID:', 'References:']):
+                body = raw.strip()
+                print(f"[EMAIL PARSING] Found body content")
+    
+    return {
+        'from': from_,
+        'subject': subject,
+        'message_id': message_id,
+        'references': references,
+        'body': body
+    }
+
+def check_reply_tracking(references, from_):
+    """Helper function to check and update reply tracking."""
+    if not references:  # If no references, not a reply
+        return
+        
+    print(f"[REPLY TRACKING] Found references: {references}")
+    with sqlite3.connect(DB_PATH) as conn:
+        # Look up the original email by its message ID in the references
+        for ref in references.split():
+            ref = ref.strip('<>')  # Remove angle brackets
+            print(f"[REPLY TRACKING] Checking reference: {ref}")
+            print(f"[REPLY TRACKING] SQL Query: SELECT id, campaign_id FROM emails WHERE message_id=? AND sent_at IS NOT NULL AND replied=0")
+            print(f"[REPLY TRACKING] Query parameters: message_id={ref}")
+            cursor = conn.execute('''SELECT id, campaign_id FROM emails 
+                                  WHERE message_id=? AND sent_at IS NOT NULL 
+                                  AND replied=0''', (ref,))
+            result = cursor.fetchone()
+            if result:
+                email_id, campaign_id = result
+                print(f"[REPLY TRACKING] Found matching email: id={email_id}, campaign_id={campaign_id}")
+                # Mark the original email as replied
+                conn.execute('''UPDATE emails SET replied=1, replied_at=? 
+                              WHERE id=?''', (datetime.utcnow(), email_id))
+                conn.commit()
+                print(f"[REPLY DETECTED] Email {email_id} from campaign {campaign_id} was replied to by {from_}")
+                break
+            else:
+                print(f"[REPLY TRACKING] No matching email found for reference: {ref}")
+                # Debug: Check if the email exists at all
+                cursor = conn.execute("SELECT id, message_id, sent_at FROM emails WHERE message_id=?", (ref,))
+                debug_result = cursor.fetchone()
+                if debug_result:
+                    print(f"[REPLY TRACKING DEBUG] Found email but not matching criteria: id={debug_result[0]}, message_id={debug_result[1]}, sent_at={debug_result[2]}")
+                else:
+                    print(f"[REPLY TRACKING DEBUG] No email found with message_id={ref}")
+
 def persistent_check_loop(host, port, user, pwd):
     key = f"{user}@{host}:{port}"
     print(f"[IDLE LOOP STARTED] {key} is now running in persistent IDLE mode.")
@@ -360,7 +471,9 @@ def persistent_check_loop(host, port, user, pwd):
                 mail.debug = 4
                 mail.login(user, pwd)
                 mail.select("inbox")
-
+                status, folders = mail.list()
+                for folder in folders:
+                    print(folder.decode())
                 # Reset retry delay on successful connection
                 retry_delay = 60
 
@@ -369,57 +482,10 @@ def persistent_check_loop(host, port, user, pwd):
                 messages = []
                 for num in data[0].split():
                     typ, msg_data = mail.fetch(num, '(BODY[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID REFERENCES)] BODY[TEXT])')
-                    from_, subject, message_id, references, body = '', '', '', '', ''
-                    for part in msg_data:
-                        if isinstance(part, tuple):
-                            raw = part[1].decode(errors='ignore')
-                            if 'From:' in raw:
-                                from_ = parse_email_address(raw.split('From:')[-1].strip())
-                            elif 'Subject:' in raw:
-                                subject = raw.split('Subject:')[-1].strip()
-                            elif 'Message-ID:' in raw:
-                                message_id = raw.split('Message-ID:')[-1].strip()
-                                if message_id:
-                                    message_id = message_id.strip()
-                                    if not message_id.startswith('<'):
-                                        message_id = f"<{message_id}>"
-                                    if not message_id.endswith('>'):
-                                        message_id = f"{message_id}>"
-                            elif 'References:' in raw:
-                                references = raw.split('References:')[-1].strip()
-                                if references:
-                                    refs = [ref.strip() for ref in references.split()]
-                                    refs = [f"<{ref}>" if not ref.startswith('<') else ref for ref in refs]
-                                    refs = [ref if ref.endswith('>') else f"{ref}>" for ref in refs]
-                                    references = ' '.join(refs)
-                            else:
-                                body = raw.strip()
+                    message = parse_email_message(msg_data)
+                    check_reply_tracking(message['references'], message['from'])
+                    messages.append(message)
                     
-                    # Check if this is a reply to one of our campaign emails
-                    if references:  # If this email references our previous emails
-                        with sqlite3.connect(DB_PATH) as conn:
-                            # Look up the original email by its message ID in the references
-                            for ref in references.split():
-                                cursor = conn.execute('''SELECT id, campaign_id FROM emails 
-                                                      WHERE uid=? AND sent_at IS NOT NULL 
-                                                      AND replied=0''', (ref.strip('<>'),))
-                                result = cursor.fetchone()
-                                if result:
-                                    email_id, campaign_id = result
-                                    # Mark the original email as replied
-                                    conn.execute('''UPDATE emails SET replied=1, replied_at=? 
-                                                  WHERE id=?''', (datetime.utcnow(), email_id))
-                                    conn.commit()
-                                    print(f"[REPLY DETECTED] Email {email_id} from campaign {campaign_id} was replied to by {from_}")
-                                    break
-
-                    messages.append({
-                        'from': from_,
-                        'subject': subject,
-                        'message_id': message_id,
-                        'references': references,
-                        'body': body
-                    })
                 per_account_messages[key] = messages
                 print(f"[INITIAL LOAD] {key} → {len(messages)} messages")
 
@@ -449,57 +515,9 @@ def persistent_check_loop(host, port, user, pwd):
                             new_messages = []
                             for num in data[0].split():
                                 typ, msg_data = mail.fetch(num, '(BODY[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID REFERENCES)] BODY[TEXT])')
-                                from_, subject, message_id, references, body = '', '', '', '', ''
-                                for part in msg_data:
-                                    if isinstance(part, tuple):
-                                        raw = part[1].decode(errors='ignore')
-                                        if 'From:' in raw:
-                                            from_ = parse_email_address(raw.split('From:')[-1].strip())
-                                        elif 'Subject:' in raw:
-                                            subject = raw.split('Subject:')[-1].strip()
-                                        elif 'Message-ID:' in raw:
-                                            message_id = raw.split('Message-ID:')[-1].strip()
-                                            if message_id:
-                                                message_id = message_id.strip()
-                                                if not message_id.startswith('<'):
-                                                    message_id = f"<{message_id}>"
-                                                if not message_id.endswith('>'):
-                                                    message_id = f"{message_id}>"
-                                        elif 'References:' in raw:
-                                            references = raw.split('References:')[-1].strip()
-                                            if references:
-                                                refs = [ref.strip() for ref in references.split()]
-                                                refs = [f"<{ref}>" if not ref.startswith('<') else ref for ref in refs]
-                                                refs = [ref if ref.endswith('>') else f"{ref}>" for ref in refs]
-                                                references = ' '.join(refs)
-                                        else:
-                                            body = raw.strip()
-                                
-                                # Check if this is a reply to one of our campaign emails
-                                if references:  # If this email references our previous emails
-                                    with sqlite3.connect(DB_PATH) as conn:
-                                        # Look up the original email by its message ID in the references
-                                        for ref in references.split():
-                                            cursor = conn.execute('''SELECT id, campaign_id FROM emails 
-                                                                  WHERE uid=? AND sent_at IS NOT NULL 
-                                                                  AND replied=0''', (ref.strip('<>'),))
-                                            result = cursor.fetchone()
-                                            if result:
-                                                email_id, campaign_id = result
-                                                # Mark the original email as replied
-                                                conn.execute('''UPDATE emails SET replied=1, replied_at=? 
-                                                              WHERE id=?''', (datetime.utcnow(), email_id))
-                                                conn.commit()
-                                                print(f"[REPLY DETECTED] Email {email_id} from campaign {campaign_id} was replied to by {from_}")
-                                                break
-
-                                new_messages.append({
-                                    'from': from_,
-                                    'subject': subject,
-                                    'message_id': message_id,
-                                    'references': references,
-                                    'body': body
-                                })
+                                message = parse_email_message(msg_data)
+                                check_reply_tracking(message['references'], message['from'])
+                                new_messages.append(message)
 
                             # Only add messages that aren't already in the list
                             existing_message_ids = {msg['message_id'] for msg in per_account_messages[key]}
@@ -525,7 +543,6 @@ def persistent_check_loop(host, port, user, pwd):
             print(f"[IDLE] {key} sleeping for {retry_delay} seconds before retry...")
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, max_delay)
-
 
 @app.route('/inbox')
 def inbox():
@@ -657,9 +674,8 @@ def parse_email_address(addr_str):
 if __name__ == '__main__':
     # Start scheduler job
     scheduler.add_job(send_next_email, 'interval', minutes=1, id='send_task')
+    send_next_email()
     background_inbox_fetch_parallel()  # Only run once
-
-    # send_next_email()
     app.run()
     # Clean shutdown
     atexit.register(lambda: scheduler.shutdown(wait=False))
